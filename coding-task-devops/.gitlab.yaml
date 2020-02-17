@@ -1,0 +1,371 @@
+image: node:8
+
+variables:
+  APP_NAME: officialsconnect-api
+  app_container_name: officialsconnect-api
+  app_second_container_name: officialsconnect-api-nginx
+  app_second_name: officialsconnect-api-nginx
+  cron_app_name: officialsconnect-api-cron
+  first_cron_name: officialsconnect-api-game-reminders
+  worker_app_name: officialsconnect-api-workers
+  first_worker_container_name: officialsconnect-api-queue-worker
+  DOCKER_DRIVER: overlay
+  DOCKER_HOST: tcp://localhost:2375
+  image_tag: $CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID
+  #environment_specific_image_tag: $CI_ENVIRONMENT_NAME-$CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID
+
+stages:
+  - setup
+  - test
+  - app_build
+  - build
+  - build_workers
+  - deploy
+  - post_deploy
+  - sandbox_setup
+  - sandbox_newrelic
+  - sandbox_build
+  - sandbox_build_nginx_static
+  - sandbox_build_workers
+  - sandbox_deploy
+  - sandbox_post_deploy
+
+setup:
+  stage: setup
+  script:
+    - yarn install
+    - yarn build
+  cache:
+    key: ${CI_BUILD_REF_NAME}
+    paths:
+      - node_modules/
+      - dist/
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - node_modules/
+      - dist/
+
+test:
+  stage: test
+  services:
+    - mysql:5.7
+    - redis:alpine
+  variables:
+    MYSQL_DATABASE: officialsconnect_api_test
+    MYSQL_ROOT_PASSWORD: root
+  script:
+    - source .env.testing
+    - yarn db:migrate && yarn db:seed:all
+    - yarn test:unit
+
+lint:
+  stage: test
+  script:
+    - yarn lint
+
+staging_newrelic:
+  stage: app_build
+  only:
+    - develop
+    - /.*release.*/
+  environment:
+    name: cplus_staging
+  before_script:
+    - apt-get update
+    - apt-get install -y gettext
+  script:
+    - envsubst < docker/newrelic/newrelic-example.txt > docker/newrelic/newrelic.js
+  dependencies:
+    - setup
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - docker/newrelic/newrelic.js
+
+prod_newrelic:
+  stage: app_build
+  only:
+    - master
+  environment:
+    name: cplus_production
+  before_script:
+    - apt-get update
+    - apt-get install -y gettext
+  script:
+    - envsubst < docker/newrelic/newrelic-example.txt > docker/newrelic/newrelic.js
+  dependencies:
+    - setup
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - docker/newrelic/newrelic.js
+
+build:
+  image: docker:latest
+  services:
+    - docker:18.09-dind
+  before_script:
+    - apk update
+    - apk add gettext
+    - docker info
+  stage: build
+  only:
+    - develop
+    - master
+    - /.*release.*/
+  allow_failure: false
+  script:
+    - docker login gitlab.bluestarsports.io:4567 -u testing -p $gitlab_personal_token
+    - docker build -t gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api:$image_tag .
+    - docker push gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api:$image_tag
+
+build_nginx_static:
+  dependencies: []
+  stage: build
+  image: docker:latest
+  variables:
+    DOCKER_DRIVER: overlay
+    DOCKER_HOST: tcp://localhost:2375
+  services:
+    - docker:18.09-dind
+  only:
+    - develop
+    - master
+    - /.*release.*/
+  script:
+    - docker login gitlab.bluestarsports.io:4567 -u testing -p $gitlab_personal_token
+    - docker build -t gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-nginx:$image_tag -f Dockerfile.nginx .
+    - docker push gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-nginx:$image_tag
+
+build_queue_worker:
+  image: docker:latest
+  services:
+    - docker:18.09-dind
+  stage: build_workers
+  only:
+    - develop
+    - master
+    - /.*release.*/
+  allow_failure: false
+  script:
+    - docker login gitlab.bluestarsports.io:4567 -u testing -p $gitlab_personal_token
+    - docker build -t gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-queue-worker:$image_tag --build-arg image_tag=$image_tag $CI_PROJECT_DIR/docker/workers/queue/
+    - docker push gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-queue-worker:$image_tag
+
+cplus_staging_deploy:
+  dependencies: []
+  stage: deploy
+  image: gitlab.bluestarsports.io:4567/devops/docker-base-images/bss-kubernetes-deploy:latest
+  only:
+    - develop
+    - /.*release.*/
+  allow_failure: false
+  environment:
+    name: cplus_staging
+  before_script:
+    - ~/setup_k8s_with_iam_user
+  script:
+    - $KUBECTL version --short
+    - $KUBECTL cluster-info
+    - . deploy/scripts/deploy_app_eks.sh
+    - . deploy/scripts/deploy_cron_eks.sh
+    - . deploy/scripts/deploy_worker_eks.sh
+
+cplus_staging_migrations:
+  variables:
+    migrationCommand: /usr/local/bin/yarn db:migrate
+    containerName: officialsconnect-api
+  stage: post_deploy
+  when: manual
+  image: gitlab.bluestarsports.io:4567/devops/docker-base-images/bss-kubernetes-deploy:latest
+  only:
+    - develop
+    - /.*release.*/
+  allow_failure: false
+  environment:
+    name: cplus_staging
+  before_script:
+    - ~/setup_k8s_with_iam_user
+  script:
+    - $KUBECTL version --short
+    - $KUBECTL cluster-info
+    - . deploy/scripts/post_deploy_migrations_eks.sh
+
+cplus_production_deploy:
+  dependencies: []
+  stage: deploy
+  image: gitlab.bluestarsports.io:4567/devops/docker-base-images/bss-kubernetes-deploy:latest
+  only:
+    - master
+  allow_failure: false
+  when: manual
+  environment:
+    name: cplus_production
+  before_script:
+    - ~/setup_k8s_with_iam_user
+  script:
+    - $KUBECTL version --short
+    - $KUBECTL cluster-info
+    - . deploy/scripts/deploy_app_eks.sh
+    - . deploy/scripts/deploy_cron_eks.sh
+    - . deploy/scripts/deploy_worker_eks.sh
+
+# This is commented out because the gitlab runner doesn't have k8s pod list permissions for the production namespace
+cplus_production_migrations:
+   variables:
+     migrationCommand: /usr/local/bin/yarn db:migrate
+     containerName: officialsconnect-api
+   stage: post_deploy
+   when: manual
+   image: gitlab.bluestarsports.io:4567/devops/docker-base-images/bss-kubernetes-deploy:latest
+   only:
+     - master
+   allow_failure: false
+   environment:
+     name: cplus_production
+   before_script:
+     - ~/setup_k8s_with_iam_user
+   script:
+     - $KUBECTL version --short
+     - $KUBECTL cluster-info
+     - . deploy/scripts/post_deploy_migrations_eks.sh
+
+##################################### officialsconnect-sandbox #########################################
+
+sandbox_setup:
+  stage: sandbox_setup
+  only:
+    - master
+    - /.*hotfix.*/
+  script:
+    - yarn
+    - yarn build
+  cache:
+    key: ${CI_BUILD_REF_NAME}
+    paths:
+      - node_modules/
+      - build/
+  dependencies: []
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - node_modules/
+      - build/
+
+sandbox_newrelic:
+  stage: sandbox_newrelic
+  only:
+    - master
+    - /.*hotfix.*/
+  environment:
+    name: cplus_sandbox
+  before_script:
+    - apt-get update
+    - apt-get install -y gettext
+  script:
+    - envsubst < docker/newrelic/newrelic-example.txt > docker/newrelic/newrelic.js
+  dependencies:
+    - sandbox_setup
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - docker/newrelic/newrelic.js
+
+sandbox_build:
+  image: docker:latest
+  variables:
+    image_tag: sandbox-$CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID
+  services:
+    - docker:18.09-dind
+  before_script:
+    - apk update
+    - apk add gettext
+    - docker info
+  stage: sandbox_build
+  only:
+    - master
+    - /.*hotfix.*/
+  allow_failure: false
+  script:
+    - docker login gitlab.bluestarsports.io:4567 -u testing -p $gitlab_personal_token
+    - docker build -t gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api:$image_tag .
+    - docker push gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api:$image_tag
+
+sandbox_build_nginx_static:
+  dependencies: []
+  stage: sandbox_build_nginx_static
+  image: docker:latest
+  variables:
+    DOCKER_DRIVER: overlay
+    DOCKER_HOST: tcp://localhost:2375
+    image_tag: sandbox-$CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID
+  services:
+    - docker:18.09-dind
+  only:
+    - master
+    - /.*hotfix.*/
+  script:
+    - docker login gitlab.bluestarsports.io:4567 -u testing -p $gitlab_personal_token
+    - docker build -t gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-nginx:$image_tag -f Dockerfile.nginx .
+    - docker push gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-nginx:$image_tag
+
+sandbox_build_queue_worker:
+  image: docker:latest
+  services:
+    - docker:18.09-dind
+  variables:
+    image_tag: sandbox-$CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID
+  stage: sandbox_build_workers
+  only:
+    - master
+    - /.*hotfix.*/
+  allow_failure: false
+  script:
+    - docker login gitlab.bluestarsports.io:4567 -u testing -p $gitlab_personal_token
+    - docker build -t gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-queue-worker:$image_tag --build-arg image_tag=$image_tag $CI_PROJECT_DIR/docker/workers/queue/
+    - docker push gitlab.bluestarsports.io:4567/officialsconnect/officialsconnect-api/officialsconnect-api-queue-worker:$image_tag
+
+cplus_sandbox_deploy:
+  dependencies: []
+  stage: sandbox_deploy
+  variables:
+    image_tag: sandbox-$CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID
+  image: gitlab.bluestarsports.io:4567/devops/docker-base-images/bss-kubernetes-deploy:latest
+  only:
+    - master
+    - /.*hotfix.*/
+  allow_failure: false
+  environment:
+    name: cplus_sandbox
+  before_script:
+    - ~/setup_k8s_with_iam_user
+  script:
+    - $KUBECTL version --short
+    - $KUBECTL cluster-info
+    - . deploy/scripts/deploy_app_eks.sh
+    - . deploy/scripts/deploy_cron_eks.sh
+    - . deploy/scripts/deploy_worker_eks.sh
+
+cplus_sandbox_migrations:
+  variables:
+    migrationCommand: /usr/local/bin/yarn db:migrate
+    containerName: officialsconnect-api
+  stage: sandbox_post_deploy
+  #variables:
+  #  image_tag: sandbox-$CI_COMMIT_REF_SLUG-$CI_PIPELINE_ID
+  when: manual
+  image: gitlab.bluestarsports.io:4567/devops/docker-base-images/bss-kubernetes-deploy:latest
+  only:
+    - master
+    - /.*hotfix.*/
+  allow_failure: false
+  environment:
+    name: cplus_sandbox
+  before_script:
+    - ~/setup_k8s_with_iam_user
+  script:
+    - $KUBECTL version --short
+    - $KUBECTL cluster-info
+    - . deploy/scripts/post_deploy_migrations_eks.sh
+
