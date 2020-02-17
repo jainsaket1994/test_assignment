@@ -1,0 +1,37 @@
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: testing-app
+  #namespace: staging
+  labels:
+    app: testing-app
+    track: stable
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: testing-app
+        track: stable
+    spec:
+      containers:
+      - name: npdb-ussf-app
+        image:
+          <name of the image in which web application is present>:$image_tag
+        imagePullPolicy: Always
+        envFrom:
+          - secretRef:
+              name: test-secrets
+        ports:
+        - containerPort: 5000
+      - name: nginx
+        image:
+          <image name >nginx:$image_tag
+        imagePullPolicy: Always
+        envFrom:
+          - secretRef:
+              name: test-secrets
+        ports:
+        - containerPort: 80
+      imagePullSecrets:
+      - name: testsecrets
