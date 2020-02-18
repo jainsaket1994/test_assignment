@@ -15,7 +15,7 @@ spec:
         track: stable
     spec:
       containers:
-      - name: npdb-ussf-app
+      - name: testing-app
         image:
           <name of the image in which web application is present>:$image_tag
         imagePullPolicy: Always
